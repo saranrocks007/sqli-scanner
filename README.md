@@ -62,16 +62,21 @@ Run the scanner with a target URL containing parameters:
 
 python sqli_scanner.py -u "https://target.com/page?id=1"
 Examples
+
 Basic Scan
 python sqli_scanner.py -u "https://target.com/page?id=1"
+
 Medium Depth Scan
 python sqli_scanner.py -u "https://target.com/page?id=1" --level 2
+
 Full Scan (includes time-based attacks)
 python sqli_scanner.py -u "https://target.com/page?id=1" --level 3
 POST Request Testing
 python sqli_scanner.py -u "https://target.com/login" --method POST --data "user=admin&pass=test"
+
 Authenticated Scan Using Cookies
 python sqli_scanner.py -u "https://target.com/profile?id=1" --cookies "session=abc123"
+
 Save Scan Report
 python sqli_scanner.py -u "https://target.com/page?id=1" --out report.txt
 Scan Levels
@@ -113,18 +118,7 @@ Database type
 Evidence
 Reporting
 
-Reports can be saved using:
 
---out report.txt
-Contribution
-
-Contributions are welcome.
-
-You can help by:
-
-Adding new payloads
-Improving detection logic
-Fixing bugs
 Improving documentation
 Author
 

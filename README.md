@@ -47,7 +47,7 @@ Installation
 
 Clone the repository from GitHub:
 
-git clone https://github.com/YOUR_USERNAME/sqli-scanner.git
+git clone https://github.com/saranrocks007/sqli-scanner.git
 
 Go into the project directory:
 

